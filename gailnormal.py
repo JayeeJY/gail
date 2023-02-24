@@ -15,6 +15,7 @@ from bc.model import utils, log
 import sys
 import os
 import pickle
+from numbers import Real
 
 from rewardoptim.Optimizer import Optimizer
 if torch.cuda.is_available():
@@ -23,16 +24,16 @@ if torch.cuda.is_available():
 
 import json
 
-LR = 5e-4
+LR = 1e-3
 MAX_EPISODES = 10000
 MAX_EPISODES_LEN = 200
 INIT_STD = 0.075
 GAMMA = 0.99
-UPDATE_INTERVAL = 1600
+UPDATE_INTERVAL = 2100
 LOG_INTERVAL = 20
 CLIP = 0.2
 EPOCH = 32
-BATCH_SIZE = 128
+BATCH_SIZE = 200
 N_ACTIONS = 3
 N_STATE_DIM = 36
 MAX_ACTION = 3
@@ -84,6 +85,25 @@ class ActorNN(nn.Module):
         mu = torch.tanh(self.mu_layer(x))*0.075
         return mu
 
+class stdNN(nn.Module):
+
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.hidden1 = nn.Linear(state_dim, 512)
+        self.hidden2 = nn.Linear(512, 256)
+        self.hidden3 = nn.Linear(256, 128)
+        self.hidden4 = nn.Linear(128, 64)
+        self.std_layer = nn.Linear(64, action_dim)
+
+
+    def forward(self, x):
+        x = torch.tanh(self.hidden1(x))
+        x = torch.tanh(self.hidden2(x))
+        x = torch.tanh(self.hidden3(x))
+        x = torch.tanh(self.hidden4(x))
+        std = torch.sigmoid(self.std_layer(x))*0.075
+        return std
+
 
 class CriticNN(nn.Module):
 
@@ -127,12 +147,16 @@ class PPO_Agent():
     def __init__(self, state_dim, action_dim, max_action, init_std, lr, gamma, epoch, clip):
 
         self.policy_actor = ActorNN(state_dim, action_dim, max_action)
+        self.std_actor = stdNN(state_dim, action_dim)
         self.gripper = GripperActorNN(state_dim)
         self.policy_critic = CriticNN(state_dim)
 
         self.base_actor = ActorNN(state_dim, action_dim, max_action)
+        self.base_std = stdNN(state_dim, action_dim)
         self.base_actor.load_state_dict(self.policy_actor.state_dict())
         self.base_actor.eval()
+        self.base_std.load_state_dict(self.std_actor.state_dict())
+        self.std_actor.eval()
 
         self.base_critic = CriticNN(state_dim)
         self.base_critic.load_state_dict(self.policy_critic.state_dict())
@@ -140,7 +164,8 @@ class PPO_Agent():
 
         self.optimizer = torch.optim.Adam([
             {'params': self.policy_actor.parameters(), 'lr': lr},
-            {'params': self.policy_critic.parameters(), 'lr': 2 * lr}
+            {'params': self.policy_critic.parameters(), 'lr': 2 * lr},
+            {'params': self.std_actor.parameters(), 'lr': lr}
         ])
         self.gripper_optimizer = torch.optim.Adam([
             {'params': self.gripper.parameters(), 'lr': lr}
@@ -157,11 +182,14 @@ class PPO_Agent():
     def select_action(self, state):
         #mu = self.base_actor(torch.FloatTensor(state))
         mu = self.base_actor(state)
-        std = self.action_std * torch.ones_like(mu)
+        #std = self.action_std * torch.ones_like(mu)
+        std = self.base_std(state)
+        #dist = Normal(mu, std)
+        #action = dist.sample()
         dist = Normal(mu, std)
-        action = dist.sample()
+        action = dist.rsample()
         logprob = dist.log_prob(action)
-        return action.cpu().numpy(), logprob.detach().cpu().numpy()
+        return action.detach().cpu().numpy(), logprob.detach().cpu().numpy()
 
     def generate_gripper(self, state):
         prob = self.gripper(state)
@@ -199,9 +227,14 @@ class PPO_Agent():
 
         for _ in range(self.epoch):
             mu = self.policy_actor(states)
-            std = self.action_std * torch.ones_like(mu)
-            dist = Normal(mu, std)
-            logprob_policy = dist.log_prob(actions).cuda()
+            #std = self.action_std * torch.ones_like(mu)
+            std = self.std_actor(states)
+            #dist = Normal(mu, std)
+            var = (std ** 2)
+            log_scale = math.log(std) if isinstance(std, Real) else std.log()
+            logprob_policy = -((actions - mu) ** 2) / (2 * var) - log_scale - math.log(math.sqrt(2 * math.pi))
+            logprob_policy = logprob_policy.cuda()
+            #logprob_policy = dist.log_prob(actions).cuda()
 
             sv_policy = self.policy_critic(states).squeeze()
 
@@ -221,6 +254,7 @@ class PPO_Agent():
             self.optimizer.step()
 
         self.base_actor.load_state_dict(self.policy_actor.state_dict())
+        self.base_std.load_state_dict(self.std_actor.state_dict())
 
     def gripperupdate(self, grip_v, exp_actions):
 
@@ -260,8 +294,10 @@ class Discriminator():
             expert_d = self.disc(torch.cat([expert_states.cuda(), expert_actions.cuda()], dim=1))
             policy_d = self.disc(torch.cat([policy_states.cuda(), policy_actions.cuda()], dim=1))
 
-            expert_loss = F.binary_cross_entropy_with_logits(expert_d, torch.ones(expert_d.size()))
-            policy_loss = F.binary_cross_entropy_with_logits(policy_d, torch.zeros(policy_d.size()))
+            #expert_loss = F.binary_cross_entropy_with_logits(expert_d, torch.ones(expert_d.size()))
+            expert_loss = F.binary_cross_entropy_with_logits(expert_d, torch.zeros(expert_d.size()))
+            #policy_loss = F.binary_cross_entropy_with_logits(policy_d, torch.zeros(policy_d.size()))
+            policy_loss = F.binary_cross_entropy_with_logits(policy_d, torch.ones(policy_d.size()))
 
             gail_loss = expert_loss + policy_loss
 
@@ -280,7 +316,8 @@ class Discriminator():
             policy_d = self.disc(policy_mix).squeeze()
             score = torch.sigmoid(policy_d)
             # gail_rewards = - (1-score).log()
-            gail_rewards = score.log() - (1 - score).log()
+            #gail_rewards = score.log() - (1 - score).log()
+            gail_rewards = (-1) * torch.log(score)
             return (states, actions, logprob_base, gail_rewards.cpu().numpy(), dones)
 
 
@@ -353,8 +390,9 @@ def main(model, dataset):
     t_per_eps = 0
     eps = 0
     reward_tmp = 0.0
-    grip_v = []
+    #grip_v = []
     rewardlog=[]
+    mselosslog=[]
     while eps <= MAX_EPISODES:
         frame = optimizer.obtoframe(curr_state)
         frame = frame.unsqueeze(0)
@@ -391,7 +429,7 @@ def main(model, dataset):
             eps += 1
             curr_state = env.reset()
 
-            agent.decay_action_std(eps, 0.1)
+            #agent.decay_action_std(eps, 0.1)
 
 
             if eps % LOG_INTERVAL == 0:
@@ -433,18 +471,21 @@ def main(model, dataset):
             #griploss = agent.gripperupdate(grip_v, exp_actions)
             lossfun = nn.MSELoss(reduction='sum')
             lossfun.to(device)
-            exp_actions = torch.FloatTensor(exp_actions).cuda()
-            pol_actions = torch.FloatTensor(pol_actions).cuda()
+            exp_actions = torch.FloatTensor(np.array(exp_actions)).cuda()
+            pol_actions = torch.FloatTensor(np.array(pol_actions)).cuda()
             mseloss = lossfun(pol_actions, exp_actions)
+            mselosslog.append(mseloss.cpu().numpy())
             loss = disc.update(expert_rollout, rollout)
             gail_loss.append(loss)
             unzipped_rollout = disc.predict_rewards(rollout)
             agent.update(unzipped_rollout)
             del rollout[:]
             del expert_rollout[:]
-            del grip_v[:]
-            with open(os.path.join(ckpt_path, "results.pkl"), "wb") as f:
+            #del grip_v[:]
+            with open(os.path.join(ckpt_path, "rewardlog.pkl"), "wb") as f:
                 pickle.dump(rewardlog, f)
+            with open(os.path.join(ckpt_path, "mselosslog.pkl"), "wb") as f:
+                pickle.dump(mselosslog, f)
             torch.save(
                 agent.policy_actor.state_dict(), os.path.join(ckpt_path, 'policy.pth')
             )
@@ -454,6 +495,10 @@ def main(model, dataset):
             torch.save(
                 disc.disc.state_dict(), os.path.join(ckpt_path, 'discriminator.pth')
             )
+            torch.save(
+                agent.std_actor.state_dict(), os.path.join(ckpt_path, 'std.pth')
+            )
+
             #torch.save(
                 #agent.gripper.state_dict(), os.path.join(ckpt_path, 'gripper.pth')
             #)
